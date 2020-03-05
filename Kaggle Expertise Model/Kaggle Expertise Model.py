@@ -108,10 +108,6 @@ Users = Users.withColumnRenamed('Id','UserId')
 
 # COMMAND ----------
 
-display(Users)
-
-# COMMAND ----------
-
 # Remove Performance Tier 0 (inactive) users 
 Users = Users.filter((Users['PerformanceTier'] == 1) | (Users['PerformanceTier'] == 2) | (Users['PerformanceTier'] == 3) | (Users['PerformanceTier'] == 4) | (Users['PerformanceTier'] == 5))
 
@@ -310,12 +306,6 @@ KernelsVotesPerRanking = KernelsAvgVotes.select('UserId', 'KernelsAvgVotes', per
 Users = Users.join(KernelsViewsPerRanking, on='UserId', how='left').join(KernelsCommentsPerRanking, on='UserId', how='left').join(KernelsVotesPerRanking, on='UserId', how='left')
 
 Users = Users.withColumn('KernelScore', (col('KernelsViewsPerRanking') + col('KernelsCommentsPerRanking') + col('KernelsVotesPerRanking'))/3)
-
-# COMMAND ----------
-
-#Users = Users.drop('KernelsViewsPerRanking')
-#Users = Users.drop('KernelsCommentsPerRanking')
-#Users = Users.drop('KernelsVotesPerRanking')
 
 # COMMAND ----------
 
@@ -760,13 +750,6 @@ display(Users_and_Tags.limit(10))
 
 # COMMAND ----------
 
-# validate that the joins worked properly
-#display(TeamMemberships.filter(col('TeamId')==496))
-#display(Users.filter(col('UserId')==647))
-#https://www.kaggle.com/c/hivprogression/leaderboard #83
-
-# COMMAND ----------
-
 # MAGIC %md
 # MAGIC #### Competition Score Per User Per Skill
 
@@ -792,10 +775,6 @@ display(ForumMessages.limit(10))
 # COMMAND ----------
 
 display(Forums.limit(3))
-
-# COMMAND ----------
-
-display(Forums.filter(col('Id')==1))
 
 # COMMAND ----------
 
@@ -899,11 +878,6 @@ Tags_df['Name Syns'] = synonyms
 skills = {}
 for idx, i in enumerate(Tags_df['Name Syns']):
     skills.update({Tags_df['Name'][idx]: i})
-
-# COMMAND ----------
-
-pp = pprint.PrettyPrinter()
-pp.pprint(skills)
 
 # COMMAND ----------
 
