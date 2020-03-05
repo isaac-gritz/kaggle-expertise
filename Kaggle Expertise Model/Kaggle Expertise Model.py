@@ -3,6 +3,16 @@
 #instructions for getting an API token: https://github.com/Kaggle/kaggle-api
 #!pip install kaggle
 #!kaggle datasets download -d kaggle/meta-kaggle
+#!pip install flashtext
+#!pip install nltk
+#%sh
+#python -m nltk.downloader all
+#!pip install beautifulsoup4
+
+# COMMAND ----------
+
+# MAGIC %sh
+# MAGIC python -m nltk.downloader all
 
 # COMMAND ----------
 
@@ -28,6 +38,21 @@ from sklearn import metrics
 from pyspark.sql.functions import *
 from pyspark.sql.window import Window
 import databricks.koalas as ks
+from flashtext import KeywordProcessor
+import glob
+import json
+import pprint
+import nltk
+from nltk import pos_tag
+from nltk.stem import PorterStemmer
+from nltk.stem.snowball import SnowballStemmer
+from nltk import word_tokenize
+import re
+import string
+from collections import Counter
+import codecs
+import html as ihtml
+from bs4 import BeautifulSoup
 
 # Enable PyArrow to optimize moving from pandas to and from Saprk Dataframes
 spark.conf.set("spark.sql.execution.arrow.enabled", "true")
@@ -255,8 +280,8 @@ display(Users)
 
 # COMMAND ----------
 
-# MAGIC %md ### Kernels Created
-# MAGIC Calculate the number of Kernels, or scripts created on Kaggle as a measure of "experience"
+# MAGIC %md ### Kernels
+# MAGIC Calculate the number of Kernels, or scripts created and their popularity on Kaggle as a measure of "experience"
 
 # COMMAND ----------
 
@@ -268,6 +293,29 @@ Kernels = Kernels.withColumnRenamed('AuthorUserId', 'UserId')
 Users_and_Kernels_Created = Users.join(Kernels, on = 'UserId', how = 'left')
 KernelsCreated = Users_and_Kernels_Created.groupBy(['UserId']).agg(countDistinct('Id')).withColumnRenamed('count(DISTINCT Id)','KernelsCreated')
 Users = Users.join(KernelsCreated, on='UserId', how='left')
+
+# COMMAND ----------
+
+# Calculate a Kernel Score that represents the average of the percentile ranking for kernel views, comments, and votes
+KernelsAvgViews = Users_and_Kernels_Created.groupBy(['UserId']).mean('TotalViews').withColumnRenamed('avg(TotalViews)','KernelsAvgViews').fillna(0)
+KernelsAvgComments = Users_and_Kernels_Created.groupBy(['UserId']).mean('TotalComments').withColumnRenamed('avg(TotalComments)','KernelsAvgComments').fillna(0)
+KernelsAvgVotes = Users_and_Kernels_Created.groupBy(['UserId']).mean('TotalVotes').withColumnRenamed('avg(TotalVotes)','KernelsAvgVotes').fillna(0)
+
+KernelsViewsPerRanking = KernelsAvgViews.select('UserId', 'KernelsAvgViews', percent_rank().over(Window.partitionBy().orderBy(KernelsAvgViews['KernelsAvgViews'])).alias('KernelsViewsPerRanking')).drop('KernelsAvgViews')
+
+KernelsCommentsPerRanking = KernelsAvgComments.select('UserId', 'KernelsAvgComments', percent_rank().over(Window.partitionBy().orderBy(KernelsAvgComments['KernelsAvgComments'])).alias('KernelsCommentsPerRanking')).drop('KernelsAvgComments')
+
+KernelsVotesPerRanking = KernelsAvgVotes.select('UserId', 'KernelsAvgVotes', percent_rank().over(Window.partitionBy().orderBy(KernelsAvgVotes['KernelsAvgVotes'])).alias('KernelsVotesPerRanking')).drop('KernelsAvgVotes')
+
+Users = Users.join(KernelsViewsPerRanking, on='UserId', how='left').join(KernelsCommentsPerRanking, on='UserId', how='left').join(KernelsVotesPerRanking, on='UserId', how='left')
+
+Users = Users.withColumn('KernelScore', (col('KernelsViewsPerRanking') + col('KernelsCommentsPerRanking') + col('KernelsVotesPerRanking'))/3)
+
+# COMMAND ----------
+
+#Users = Users.drop('KernelsViewsPerRanking')
+#Users = Users.drop('KernelsCommentsPerRanking')
+#Users = Users.drop('KernelsVotesPerRanking')
 
 # COMMAND ----------
 
@@ -329,20 +377,21 @@ experts.count()
 # MAGIC - Have less than 5 followers
 # MAGIC - Have at most 1 medal in competitions, scripts, discussions
 # MAGIC - Created at most 1 kernel
+# MAGIC - Kernel score is in the bottom 25%
 
 # COMMAND ----------
 
 non_experts = Users.filter((col('CompetitionPerRanking').isNull()) & (col('ScriptPerRanking').isNull()) & (col('DiscussionPerRanking').isNull()) & (col('PerformanceTier') == 1) \
-                           & (col('NumFollowers') < 5) & (Users['TotalDisc'] == 0) & (Users['TotalComp'] == 0) & (Users['TotalScript'] == 0) \
-                           & (col('KernelsCreated') < 2))
+                           & (col('NumFollowers') < 5) & (Users['TotalDisc'] <= 1) & (Users['TotalComp'] <= 1) & (Users['TotalScript'] <= 1) \
+                           & (col('KernelsCreated') < 2) & (col('KernelScore') <= 0.25))
 
 # COMMAND ----------
 
-non_experts.count()
+#non_experts.count()
 
 # COMMAND ----------
 
-Users.count()
+#Users.count()
 
 # COMMAND ----------
 
@@ -357,11 +406,11 @@ experts = experts.withColumn('Expert', lit(1))
 # COMMAND ----------
 
 # reduce the number of non-expert examples to the same as the number of experts
-non_experts_downsampled = non_experts.sample(False, 0.1, 1).limit(experts.count())
+non_experts_downsampled = non_experts.sample(False, 0.2, 1).limit(experts.count())
 
 # COMMAND ----------
 
-non_experts_downsampled.count()
+#non_experts_downsampled.count()
 
 # COMMAND ----------
 
@@ -437,11 +486,6 @@ train_df.columns
 
 # COMMAND ----------
 
-### Add Tier as a categorical variable
-### Create a "Ranked" column for 0 or 1 ranked or not ranked in any of the 3 - categorical column
-
-# COMMAND ----------
-
 # fill missing values with 0
 train_df = train_df.fillna(0)
 
@@ -475,7 +519,7 @@ def encode_categorical(data, cols, replace=False):
 # COMMAND ----------
 
 # encode PerformenaceTier and Ranked Columns
-train_df, _, _ = encode_categorical(train_df, ['PerformanceTier', 'Ranked'], replace = True)
+train_df, _, _ = encode_categorical(train_df, ['Ranked'], replace = True)
 
 # COMMAND ----------
 
@@ -502,12 +546,12 @@ for i in test_df['AvgPerRanking']:
 test_df['Ranked'] = ranked
 
 # encode PerformenaceTier and Ranked Columns
-test_df, _, _ = encode_categorical(test_df, ['PerformanceTier', 'Ranked'], replace = True)
+test_df, _, _ = encode_categorical(test_df, ['Ranked'], replace = True)
 
 # COMMAND ----------
 
 y = train_df['Expert']
-X = train_df[['NumFollowers', 'TotalMedals', 'KernelsCreated', 'Ranked']]
+X = train_df[['NumFollowers', 'TotalMedals', 'KernelsCreated', 'KernelScore', 'Ranked']]
 
 # Split into 80-20 Training-Test Set
 X_train, X_val, y_train, y_val = train_test_split(X, y, test_size = 0.2)
@@ -555,36 +599,478 @@ df = train_df.append(test_df, sort = 'False')
 
 # COMMAND ----------
 
-#df = df.drop(['ExpertisePred', 'ExpertiseScore'], axis = 'columns')
+df['ExpertisePred'] = pd.Series(lr.predict(df[['NumFollowers', 'TotalMedals', 'KernelsCreated', 'KernelScore', 'Ranked']]))
+df['ExpertiseScore'] = pd.DataFrame(lr.predict_proba(df[['NumFollowers', 'TotalMedals', 'KernelsCreated', 'KernelScore', 'Ranked']]))[1]
 
 # COMMAND ----------
 
-df['ExpertisePred'] = pd.Series(lr.predict(df[['NumFollowers', 'TotalMedals', 'KernelsCreated', 'Ranked']]))
-                                
-df['ExpertiseScore'] = pd.DataFrame(lr.predict_proba(df[['NumFollowers', 'TotalMedals', 'KernelsCreated', 'Ranked']]))[1]
+df[['UserName','NumFollowers', 'TotalMedals', 'KernelsCreated','KernelScore', 'Ranked', 'ExpertiseScore']].head(10)
 
 # COMMAND ----------
 
-df.sort_values('ExpertiseScore', ascending = False)
+df[(df['UserName']=='jiweiliu')]
 
 # COMMAND ----------
 
-train_df[train_df['Expert']==1]['KernelsCreated'].value_counts()
+# MAGIC %md
+# MAGIC ## User Skill Quantification
+# MAGIC ### Skill Taxonomy
+# MAGIC Tags are associated to Kaggle competitions, datasets, and kernels. These tags will be used as the taxonomy for skills.
 
 # COMMAND ----------
 
-df.sort_values('ExpertiseScore', ascending = False)[['UserName', 'ExpertiseScore', 'ExpertisePred', 'PerformanceTier', 'NumOrgs', 'NumFollowers', 'KernelsCreated', 'TotalDisc', 'TotalComp', 'TotalScript', 'CompetitionPerRanking', 'DiscussionPerRanking', 'ScriptPerRanking']]
+# MAGIC %md
+# MAGIC ### Tags
 
 # COMMAND ----------
 
-#display(Users2.groupBy('PerformanceTier').count().orderBy('count'))
+display(Tags.limit(10))
 
 # COMMAND ----------
 
-'''### Save for kernel skill quantification
+# rename Id column to TagId
+Tags = Tags.withColumnRenamed('Id','TagId')
 
-# Kernel Rank Categorical Variable: Gold = 1, Silver = 2, Bronze = 3, No Medal = 4
-Kernels = Kernels.fillna(4, subset = ['Medal']).withColumnRenamed('Medal','MedalRank')
+# COMMAND ----------
 
-df_basket1.select("Item_group","Item_name","Price", F.percent_rank().over(Window.partitionBy(df_basket1['Item_group']).orderBy(df_basket1['price'])).alias("percent_rank"))
-df_basket1.show()'''
+# MAGIC %md
+# MAGIC ### Kernel-Skill Quantification
+# MAGIC Determine a kernel score for each associated tag/skill
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #### Kernel Tags
+
+# COMMAND ----------
+
+display(Kernels.limit(10))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #### Determine kernel scores per skill
+
+# COMMAND ----------
+
+Kernels = spark.read.format('csv').options(header='true', inferSchema='true').load('/FileStore/tables/Kernels.csv')
+Kernels = Kernels.withColumnRenamed('AuthorUserId', 'UserId')
+
+# COMMAND ----------
+
+# rename Id column to TagId
+Kernels = Kernels.withColumnRenamed('Id','KernelId')
+
+# Calculate a Kernel Score that represents the percentile ranking for kernel views, comments, and votes
+KernelsViewsPercentile = Kernels.select('KernelId', 'TotalViews', percent_rank().over(Window.partitionBy().orderBy(Kernels['TotalViews'])).alias('KernelsViewsPercentile')).drop('TotalViews')
+KernelsCommentsPercentile= Kernels.select('KernelId', 'TotalComments', percent_rank().over(Window.partitionBy().orderBy(Kernels['TotalComments'])).alias('KernelsCommentsPercentile')).drop('TotalComments')
+KernelsVotesPercentile = Kernels.select('KernelId', 'TotalVotes', percent_rank().over(Window.partitionBy().orderBy(Kernels['TotalVotes'])).alias('KernelsVotesPercentile')).drop('TotalVotes')
+
+Kernels = Kernels.join(KernelsViewsPercentile, on='KernelId', how='left').join(KernelsCommentsPercentile, on='KernelId', how='left').join(KernelsVotesPercentile, on='KernelId', how='left')
+Kernels = Kernels.withColumn('KernelScore', (col('KernelsViewsPercentile') + col('KernelsCommentsPercentile') + col('KernelsVotesPercentile'))/3)
+
+# COMMAND ----------
+
+Kernels2 = Kernels[['KernelId','UserId','Medal','TotalViews','TotalComments','TotalVotes', 'KernelScore']]
+KernelTags = KernelTags[['KernelId','TagId']]
+
+Kernel_and_Tags = Kernels2.join(KernelTags, on = 'KernelId', how = 'left')
+Kernel_and_Tags = Kernel_and_Tags.join(Tags, on = 'TagId', how = 'left')
+Kernel_and_Tags = Kernel_and_Tags.dropna(subset=['Name'])
+
+# COMMAND ----------
+
+display(Kernel_and_Tags.limit(10))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #### Kernel Scores Per User Per Skill
+
+# COMMAND ----------
+
+# Calculate Average Kernel Score Per User Per skill
+KernelScores = Kernel_and_Tags[['UserId','KernelScore','Name']].groupBy(['UserId','Name']).mean().fillna(0).drop('avg(UserId)').withColumnRenamed('avg(KernelScore)', 'KernelScore')
+
+# COMMAND ----------
+
+display(KernelScores.limit(10))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Competition-Skill Quantification
+# MAGIC Determine a competition score for each associated skill/tag
+
+# COMMAND ----------
+
+# Joining Competitions, CompetitionTags, Teams, TeamMemberships, and User tables to get Competition Data and Skills per user
+display(Competitions.limit(3))
+
+# COMMAND ----------
+
+display(CompetitionTags.limit(3))
+
+# COMMAND ----------
+
+Competitions2 = Competitions[['Id','OrganizationId']]
+
+# rename Id column to CompetitionId
+Competitions2 = Competitions2.withColumnRenamed('Id','CompetitionId')
+
+# COMMAND ----------
+
+display(Teams.limit(3))
+
+# COMMAND ----------
+
+display(TeamMemberships.limit(3))
+
+# COMMAND ----------
+
+# rename Id column to TeamId
+Teams = Teams.withColumnRenamed('Id','TeamId')
+
+# Linking Teams to Competitions, Competitions to Tags, and Teams to Users to get competition data and tags per user
+Teams2 = Teams.dropna(subset = ['ScoreFirstSubmittedDate'])
+Teams2 = Teams2[['TeamId','CompetitionId','Medal','PublicLeaderboardRank']]
+
+# Calculate each team's public leaderboard percentile rank
+TeamsRankPer = Teams2.select('CompetitionId', 'TeamId', 'PublicLeaderboardRank', percent_rank().over(Window.partitionBy().orderBy(Teams2['PublicLeaderboardRank'].desc())).alias('RankPer')).drop('PublicLeaderboardRank')
+
+# Calculate each team's medal percentile rank
+TeamsMedalPer = Teams2.fillna(4, subset = ['Medal']).select('CompetitionId', 'TeamId', 'Medal', percent_rank().over(Window.partitionBy().orderBy(Teams2['Medal'])).alias('MedalPer')).drop('Medal')
+
+# Calcualte competition score as an average of the team's rank percentile and medal percentile
+Teams2 = Teams2.join(TeamsRankPer, on = 'TeamId', how = 'left').join(TeamsMedalPer, on = 'TeamId', how = 'left')
+Teams2 = Teams2.withColumn('CompScore', (col('RankPer') + col('MedalPer'))/2)
+
+# Join teams with competition tags and team membership to get team competition scores associated with skills and users
+Teams_and_Tags = Teams2.join(CompetitionTags, on = 'CompetitionId', how = 'left')
+Teams_and_Tags = Teams_and_Tags.dropna(subset = ['TagId'])
+Teams_and_Tags = Teams_and_Tags.join(Tags, on = 'TagId', how = 'left')
+
+# rename Id column to TeamId
+TeamMemberships = TeamMemberships[['TeamId', 'UserId']]
+Users_and_Tags = Teams_and_Tags.join(TeamMemberships, on = 'TeamId', how = 'left')
+
+# COMMAND ----------
+
+display(Users_and_Tags.limit(10))
+
+# COMMAND ----------
+
+# validate that the joins worked properly
+#display(TeamMemberships.filter(col('TeamId')==496))
+#display(Users.filter(col('UserId')==647))
+#https://www.kaggle.com/c/hivprogression/leaderboard #83
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #### Competition Score Per User Per Skill
+
+# COMMAND ----------
+
+# Calculate Competition Score Per User Per skill
+CompScores = Users_and_Tags[['UserId', 'Name', 'CompScore']].groupBy(['UserId','Name']).mean().fillna(0).drop('avg(UserId)').withColumnRenamed('avg(CompScore)', 'CompScore')
+
+# COMMAND ----------
+
+display(CompScores.limit(3))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Discussion-Skill Quantification
+# MAGIC Determine a discussion score for each associated skill/tag using NLP
+
+# COMMAND ----------
+
+display(ForumMessages.limit(10))
+
+# COMMAND ----------
+
+display(Forums.limit(3))
+
+# COMMAND ----------
+
+display(Forums.filter(col('Id')==1))
+
+# COMMAND ----------
+
+Forums2 = Forums.withColumnRenamed('Id','ForumTopicId')
+
+# COMMAND ----------
+
+# Rename Ids
+Forums = Forums.withColumnRenamed('Id','ForumTopicId')
+ForumMessages = ForumMessages.withColumnRenamed('Id','MessageId').withColumnRenamed('PostUserId','UserId')
+
+# Join Forums with Messages
+Forums_and_Messages = Forums2.join(ForumMessages, how = 'left', on = 'ForumTopicId')
+
+# Remove blank messages and keep necessary columns
+Forums_and_Messages = Forums_and_Messages[['UserId', 'ForumTopicId', 'Title', 'Message', 'Medal']].dropna(subset = ['Message'])
+
+# COMMAND ----------
+
+# convert to pandas df to use NLP techniques
+Forums_and_Messages_df = Forums_and_Messages.toPandas()
+
+# COMMAND ----------
+
+Forums_and_Messages_df.head(3)
+
+# COMMAND ----------
+
+# function to remove html tags, hyperlinks, punctuation, numbers, and stem text from a df
+def clean_text_df(df, col):
+    cleaned_text = []
+    for i in df[col]:
+        # remove html tags
+        text = BeautifulSoup(ihtml.unescape(i), "lxml").text
+        # standardize spacing
+        text = re.sub(r"\s+", " ", text)
+        # remove hyperlinks
+        text = re.sub(r"http[s]?://\S+", "", text)
+        filtered_tokens = []
+        if str(text) != 'nan' and str(text) != '' and str(text) != ' ':
+            # first tokenize by sentence, then by word to ensure that punctuation is caught as it's own token
+            tokens = [word for sent in nltk.sent_tokenize(text) for word in nltk.word_tokenize(sent)]
+            for token in tokens:
+                # filter out any tokens not containing letters (e.g., numeric tokens, raw punctuation)
+                if re.search('[a-zA-Z]', token):
+                    # remove punctuation
+                    filtered_tokens.append(token.translate(str.maketrans({key: None for key in string.punctuation})))
+        else:
+            filtered_tokens.append('')
+        stems = [stemmer.stem(t) for t in filtered_tokens]
+        phrase = ' '.join(stems)
+        cleaned_text.append(phrase)
+    return cleaned_text
+
+# COMMAND ----------
+
+# function to remove punctuation, numbers, and stem text from a list
+def clean_list(lst):
+    filtered_tokens = []
+    for token in lst:
+        # filter out any tokens not containing letters (e.g., numeric tokens, raw punctuation)
+        if re.search('[a-zA-Z]', token):
+            # remove punctuation
+            filtered_tokens.append(token.translate(str.maketrans({key: None for key in string.punctuation})))
+    stems = [stemmer.stem(t) for t in filtered_tokens]
+    return stems
+
+# COMMAND ----------
+
+# define stopwords
+stopwords = nltk.corpus.stopwords.words('english')
+
+# define stemmer
+stemmer = SnowballStemmer("english")
+
+# COMMAND ----------
+
+Forums_and_Messages_df['Message Clean'] = clean_text_df(Forums_and_Messages_df, 'Message')
+
+# COMMAND ----------
+
+Forums_and_Messages_df.head(5)
+
+# COMMAND ----------
+
+Tags_df = Tags.toPandas()
+
+# COMMAND ----------
+
+Tags_df.head(3)
+
+# COMMAND ----------
+
+# Create a skill dictionary 
+synonyms = []
+for i in Tags_df['Name']:
+    synonyms.append([i])
+    
+Tags_df['Name Syns'] = synonyms
+
+skills = {}
+for idx, i in enumerate(Tags_df['Name Syns']):
+    skills.update({Tags_df['Name'][idx]: i})
+
+# COMMAND ----------
+
+pp = pprint.PrettyPrinter()
+pp.pprint(skills)
+
+# COMMAND ----------
+
+# stem all of the skill names
+for key, value in skills.items():
+    skills[key] = clean_list(skills[key])
+
+# COMMAND ----------
+
+skills
+
+# COMMAND ----------
+
+# add skill dictionary as keywords
+keyword_processor = KeywordProcessor()
+keyword_processor.add_keywords_from_dict(skills)
+
+# COMMAND ----------
+
+matches = []
+
+for i in Forums_and_Messages_df['Message Clean']:
+    if i != '':
+        if str(i) != 'nan':
+            if keyword_processor.extract_keywords(i) != []:
+                matches.append(keyword_processor.extract_keywords(i))
+            else:
+                matches.append(np.nan)
+        else:
+            matches.append(np.nan)
+    else:
+        matches.append(np.nan)
+
+# join back into a dataframe
+Forums_and_Messages_df['Name'] = matches
+
+# COMMAND ----------
+
+# drop rows where no skills were found
+Forums_and_Messages_df = Forums_and_Messages_df.dropna(subset = ['Name'])
+
+# COMMAND ----------
+
+# Split the values of a column and expand so the new DataFrame has one split value per row.
+# Filters rows where the column is missing
+def tidy_split(df, column, sep=',', keep=False):
+    indexes = list()
+    new_values = list()
+    #df = df.dropna(subset=[column])
+    for i, presplit in enumerate(df[column].astype(str)):
+        values = presplit.split(sep)
+        if keep and len(values) > 1:
+            indexes.append(i)
+            new_values.append(presplit)
+        for value in values:
+            indexes.append(i)
+            new_values.append(value)
+    new_df = df.iloc[indexes, :].copy()
+    new_df[column] = new_values
+    new_df[column] = new_df[column].str.strip()
+    new_df[column] = new_df[column].str.replace('[','').str.replace(']','').str.replace("'",'')
+    return new_df
+
+# COMMAND ----------
+
+# explode skill list into rows
+Forums_and_Messages_Exploded = tidy_split(Forums_and_Messages_df[['UserId', 'Name']], 'Name').reset_index(drop=True)
+Forums_and_Messages_Exploded.head(5)
+
+# COMMAND ----------
+
+DiscScores = Forums_and_Messages_Exploded.groupby(['UserId', 'Name']).size().reset_index(name = 'Count')
+DiscScores.head(5)                                                                                                     
+
+# COMMAND ----------
+
+DiscScores['DiscScore'] = DiscScores.groupby('Name')['Count'].rank(pct=True)
+DiscScores = DiscScores.drop(['Count'], axis = 'columns')
+
+# COMMAND ----------
+
+# convert competition scores and kernel scores to pandas dfs
+CompScores_df = ks.DataFrame(CompScores).toPandas()
+KernelScores_df = ks.DataFrame(KernelScores).toPandas()
+
+# COMMAND ----------
+
+DiscScores.head(3)
+
+# COMMAND ----------
+
+CompScores_df.head(3)
+
+# COMMAND ----------
+
+KernelScores_df.head(3)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Overall Skill Score
+# MAGIC Combine kernel score, competition score and dataset scores into a single skill score heuristic.
+
+# COMMAND ----------
+
+CompScores_df['UserId'] = CompScores_df['UserId'].astype(str)
+KernelScores_df['UserId'] = KernelScores_df['UserId'].astype(str)
+
+SkillScores = CompScores_df.merge(KernelScores_df, how = 'outer', on = ['UserId', 'Name'])
+SkillScores = SkillScores.merge(DiscScores, how = 'outer', on = ['UserId', 'Name'])
+SkillScores = SkillScores.fillna(0)
+
+SkillScores['SkillScore'] = (SkillScores['CompScore'] + SkillScores['KernelScore'] + SkillScores['DiscScore'])/3
+
+# COMMAND ----------
+
+SkillScores.sort_values('SkillScore', ascending = False).head(10)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Expertise Finding
+# MAGIC Incorporating both skill scores and overall expertise scores for ranking skill based expert searches
+
+# COMMAND ----------
+
+df['UserId'] = df['UserId'].astype(str)
+Users_and_Skills = df.drop('KernelScore', axis = 'columns').merge(SkillScores, on = 'UserId', how = 'left').fillna(0)
+Users_and_Skills['CombinedScore'] = (Users_and_Skills['ExpertiseScore'] * 0.25) + (Users_and_Skills['SkillScore'] * 0.75)
+
+# COMMAND ----------
+
+Users_and_Skills[(Users_and_Skills['UserId']=='808') & ((Users_and_Skills['Name']=='linear regression') | (Users_and_Skills['Name']=='neural networks'))][['UserId', 'DisplayName', 'Name', 'DiscScore']]
+
+# COMMAND ----------
+
+Users_and_Skills.head(5)
+
+# COMMAND ----------
+
+def ExpertiseFinding(skill):
+  Experts = Users_and_Skills[Users_and_Skills['Name'] == skill.lower()]
+  Experts = Experts[['DisplayName', 'ExpertiseScore', 'SkillScore', 'CombinedScore', 'PerformanceTier', 'NumOrgs', 'KernelsCreated', 'NumFollowers', 'TotalComp', 'TotalDisc', 'TotalScript', 'TotalMedals', 'Ranked']]
+  Experts = Experts.rename(columns={'DisplayName': 'Name', 'SkillScore': skill.title() +' Score',
+                                    'ExpertiseScore':'Expertise Score',
+                                    'CombinedScore': 'Combined Score',
+                                    'PerformanceTier':'Performance Tier', 
+                                    'NumOrgs':'# of Orgs',
+                                    'KernelsCreated':'# of Kernels Created', 
+                                    'NumFollower':'# of Followers', 
+                                    'TotalComp':'# of Competition Medals',
+                                    'TotalDisc':'# of Discussion Medals',
+                                    'TotalScript':'# of Script Medals',
+                                    'TotalMedals':'# of Total Medals'
+                                   })
+  Experts.iloc[0:,4:] = Experts.iloc[0:,4:].astype('int')
+  Experts = Experts.sort_values(['Combined Score'], ascending=[False]).reset_index(drop=True)
+  Experts.index = Experts.index + 1
+  Experts = Experts.head(25)
+  return Experts
+
+# COMMAND ----------
+
+skill = 'time series'
+ExpertiseFinding(skill)
+
+# COMMAND ----------
+
+# Kaggle Skills
+display(Tags.select('Name'))
